@@ -15,10 +15,8 @@ st.set_page_config(
 
 st.title("🚚 Carrier Lane Analyzer & Scorecard")
 st.caption(
-    "Upload a CSV with carrier performance. The app recommends the best carrier(s) per lane "
-    "and builds a carrier scorecard. Weights: Milestone Completeness 50%, Shipment Volume 30% "
-    "(min–max scaled within lane), Tracked % 20%. Tie-breaker: lowest Avg Ping Frequency (mins). "
-    "All numbers are rounded to 1 decimal place."
+    "Upload Truckload Analytics output file (filtered by lanes) downloaded from Movement. The app recommends the best carrier(s) per lane "
+    "and builds a carrier scorecard."
 )
 
 # ---------------------------

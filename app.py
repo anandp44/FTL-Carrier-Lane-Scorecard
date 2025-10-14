@@ -15,10 +15,10 @@ st.set_page_config(
 
 st.title("🚚 Carrier Lane Analyzer & Scorecard")
 st.caption(
-    "Upload 'Truckload Analytics output file- filtered by lane' from Movement. The app recommends the best carrier(s) per lane "
+    "Upload a CSV with carrier performance. The app recommends the best carrier(s) per lane "
     "and builds a carrier scorecard. Weights: Milestone Completeness 50%, Shipment Volume 30% "
     "(min–max scaled within lane), Tracked % 20%. Tie-breaker: lowest Avg Ping Frequency (mins). "
-    "All numbers are rounded to 2 decimal places."
+    "All numbers are rounded to 1 decimal place. You can add an optional Customer Name."
 )
 
 # ---------------------------
@@ -58,7 +58,6 @@ ALIASES = {
 
 NUMERIC_KEYS = ["volume", "tracked", "avg_ping", "mc", "oa", "od", "da", "dd", "pu30", "do30"]
 PCT_KEYS = ["tracked", "mc", "oa", "od", "da", "dd", "pu30", "do30"]
-
 DECIMALS = 1  # global rounding
 
 # ---------------------------
@@ -110,7 +109,6 @@ def lane_key(row, pickup_col, dropoff_col) -> str:
     return f"{row[pickup_col]} ⟶ {row[dropoff_col]}"
 
 def round_numeric(df: pd.DataFrame, decimals: int = DECIMALS) -> pd.DataFrame:
-    """Round all numeric columns to N decimals."""
     out = df.copy()
     num_cols = out.select_dtypes(include=[np.number]).columns
     out[num_cols] = out[num_cols].round(decimals)
@@ -143,7 +141,7 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
     work = work.merge(lane_counts, on="Lane", how="left")
     work["Single Carrier Lane"] = np.where(work["Num Carriers In Lane"] == 1, "Yes", "No")
 
-    # Scale Shipment Volume within each lane
+    # Scale Shipment Volume within each lane (for scoring only)
     work["Scaled Shipment Volume (Lane)"] = work.groupby("Lane")[CANON["volume"]].transform(minmax_scale_0_100)
 
     # Weighted score (0–100)
@@ -179,16 +177,14 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
     lane_recs = pd.DataFrame(rec_rows)
 
     # --- Carrier Scorecard (exact columns requested) ---
-    # Counts of lanes where carrier is #1 or #2
     rank_counts = lane_recs.groupby([CANON["carrier"], "Recommendation Rank"])["Lane"].nunique().unstack(fill_value=0)
     rank_counts = rank_counts.rename(columns={1: "Lanes as Recommendation #1", 2: "Lanes as Recommendation #2"}).reset_index()
 
-    # Aggregates from full dataset (not just recommended rows)
     agg_map = {
-        CANON["volume"]: "sum",                  # Shipment Volume (sum)
-        CANON["tracked"]: "mean",                # Visibility Percentage (mean)
-        CANON["mc"]: "mean",                     # Milestone Completeness (mean)
-        CANON["avg_ping"]: "mean",               # Avg Ping Frequency Mins (mean)
+        CANON["volume"]: "sum",      # Shipment Volume (sum)
+        CANON["tracked"]: "mean",    # Visibility Percentage (mean)
+        CANON["mc"]: "mean",         # Milestone Completeness (mean)
+        CANON["avg_ping"]: "mean",   # Avg Ping Frequency Mins (mean)
     }
     for k in ["oa", "od", "da", "dd", "pu30", "do30"]:
         col = CANON[k]
@@ -197,7 +193,6 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
 
     base_agg = work.groupby(CANON["carrier"]).agg(agg_map).reset_index()
 
-    # Build final scorecard with exact headers
     scorecard = base_agg.rename(columns={
         CANON["carrier"]: "Carrier Name",
         CANON["volume"]: "Shipment Volume",
@@ -234,37 +229,59 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
         "Pickup Arrival Within 30 Min Percent",
         "Dropoff Arrival Within 30 Min Percent",
     ]
-    # Add any missing optional columns as NaN so the header is always present
     for c in desired_cols:
         if c not in scorecard.columns:
             scorecard[c] = np.nan
     scorecard = scorecard[desired_cols]
 
-    # --- Lane Recommendations sheet: include ALL original input columns + computed fields ---
-    input_cols = [c for c in df.columns]  # user's original columns
+    # --- Lane Recommendations: include ALL original input columns (+ minimal computed) and GUARANTEE tracked shows up ---
+    input_cols = [c for c in df.columns]  # keep user's original columns
+    lane_recs_subset = lane_recs.copy()
+
+    # Copy back original-named columns from canonical (for any mapped field)
+    for key, orig_name in mapping.items():
+        if not orig_name:
+            continue
+        canon_name = CANON[key]
+        if canon_name in lane_recs_subset.columns and orig_name not in lane_recs_subset.columns:
+            lane_recs_subset[orig_name] = lane_recs_subset[canon_name]
+
+    # Build final columns: all original columns + minimal computed columns (NO scaled volume, NO weighted score)
     computed_cols = [
         "Lane",
         "Recommendation Rank",
         "Num Carriers In Lane",
         "Single Carrier Lane",
-        "Scaled Shipment Volume (Lane)",
-        "Weighted Score",
     ]
-    # Map back: if we renamed some columns to canonical names that differ from input, bring both
-    # Start from the 'work' copy for accurate values but ensure we select the user's columns if present
-    lane_recs_subset = lane_recs.copy()
-    # Ensure all original columns appear (pull from lane_recs which is based on 'work')
-    for col in input_cols:
-        if col not in lane_recs_subset.columns and col in work.columns:
-            lane_recs_subset[col] = lane_recs[col] if col in lane_recs.columns else work[col]
-
-    # Compose final columns order: user input cols (as-is), then our computed columns (if present)
-    final_lane_cols = [c for c in input_cols if c in lane_recs_subset.columns] + [c for c in computed_cols if c in lane_recs_subset.columns]
+    # Guarantee Tracked % is present using the original input name if possible
+    tracked_orig = mapping.get("tracked")
+    if tracked_orig and tracked_orig not in input_cols:
+        input_cols.append(tracked_orig)  # safety (shouldn't happen)
+    # Compose final list without duplicates, preserving order
+    def uniq(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x in lane_recs_subset.columns and x not in seen:
+                out.append(x); seen.add(x)
+        return out
+    final_lane_cols = uniq(input_cols + computed_cols)
     lane_recs_final = lane_recs_subset[final_lane_cols].copy()
 
-    # Round all numerics to DECIMALS
+    # Round numerics
     lane_recs_final = round_numeric(lane_recs_final, DECIMALS)
     scorecard = round_numeric(scorecard, DECIMALS)
+
+    # Sort BOTH sheets by descending Shipment Volume
+    # For lane sheet, sort by the original volume column if it exists; else by canonical
+    vol_col_lane = mapping.get("volume") if mapping.get("volume") in lane_recs_final.columns else (
+        CANON["volume"] if CANON["volume"] in lane_recs_final.columns else None
+    )
+    if vol_col_lane:
+        lane_recs_final = lane_recs_final.sort_values(by=vol_col_lane, ascending=False, kind="mergesort")
+    # For scorecard, we know "Shipment Volume" exists
+    if "Shipment Volume" in scorecard.columns:
+        scorecard = scorecard.sort_values(by="Shipment Volume", ascending=False, kind="mergesort")
 
     return lane_recs_final, scorecard
 
@@ -283,11 +300,13 @@ def autosize_and_write_excel(sheets: Dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 # ---------------------------
-# Sidebar: file input + mapping
+# Sidebar: file input + mapping + customer name
 # ---------------------------
 with st.sidebar:
     st.header("Upload & Column Mapping")
     uploaded = st.file_uploader("Upload CSV file", type=["csv"])
+
+    customer_name = st.text_input("Customer Name (optional)", placeholder="e.g., Acme Corp")
 
     if uploaded is not None:
         try:
@@ -339,8 +358,17 @@ else:
         try:
             lane_recs, carrier_scorecard = compute_recommendations(raw, mapping_live)
 
+            # Add Customer Name column (if provided)
+            if customer_name:
+                lane_recs.insert(0, "Customer Name", customer_name)
+                carrier_scorecard.insert(0, "Customer Name", customer_name)
+
             st.subheader("✅ Lane Recommendations (Truckload Analytics)")
-            st.caption("Rank 1 is always present per lane; Rank 2 is included if within 10% of Rank 1’s score. All numbers shown are rounded to 1 decimal place.")
+            st.caption(
+                "Rank 1 is present per lane; Rank 2 appears if within 10% of Rank 1’s score. "
+                "Columns for scaled volume and weighted score are omitted from outputs by request. "
+                "All numbers are rounded to 1 decimal place, sorted by Shipment Volume (desc)."
+            )
             st.dataframe(lane_recs, use_container_width=True, height=420)
 
             # ---------------------------
@@ -364,27 +392,37 @@ else:
             st.dataframe(lane_filtered, use_container_width=True, height=300)
 
             # Build filtered XLSX for download (only the lane sheet)
-            filtered_xlsx = autosize_and_write_excel({"Lane Recommendations (Filtered)": lane_filtered})
+            sheets_filtered = {"Lane Recommendations (Filtered)": lane_filtered}
+            filtered_xlsx = autosize_and_write_excel(sheets_filtered)
+
+            def sanitize_filename(s: str) -> str:
+                return "".join(c for c in s if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_")
+
+            fname_suffix = f"__{sanitize_filename(customer_name)}" if customer_name else ""
             st.download_button(
                 label="⬇️ Download filtered lanes (XLSX)",
                 data=filtered_xlsx,
-                file_name="truckload_analytics_filtered_by_lanes.xlsx",
+                file_name=f"truckload_analytics_filtered_by_lanes{fname_suffix}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
             st.subheader("📊 Carrier Scorecard")
-            st.caption("One row per carrier. Counts of lanes where they are Recommendation #1 and #2, plus aggregated metrics (means/sums). All numbers are rounded to 1 decimal place.")
+            st.caption(
+                "One row per carrier with counts of lanes where they are Recommendation #1 and #2, "
+                "plus aggregated metrics. All numbers rounded to 1 decimal place and sorted by Shipment Volume (desc)."
+            )
             st.dataframe(carrier_scorecard, use_container_width=True, height=420)
 
             # Full XLSX (two sheets)
-            xlsx_bytes = autosize_and_write_excel({
+            sheets_full = {
                 "Lane Recommendations": lane_recs,
                 "Carrier Scorecard": carrier_scorecard
-            })
+            }
+            xlsx_bytes = autosize_and_write_excel(sheets_full)
             st.download_button(
                 label="⬇️ Download XLSX (Lane Recommendations + Carrier Scorecard)",
                 data=xlsx_bytes,
-                file_name="carrier_lane_analysis_and_scorecard.xlsx",
+                file_name=f"carrier_lane_analysis_and_scorecard{fname_suffix}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
@@ -398,4 +436,3 @@ st.markdown(
     "All numbers in outputs are rounded to 1 decimal place.</small>",
     unsafe_allow_html=True,
 )
-

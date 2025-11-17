@@ -1,5 +1,124 @@
+from __future__ import annotations
+
+import io
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------------------------
+# Page setup
+# ---------------------------
+st.set_page_config(
+    page_title="Carrier Lane Analyzer & Scorecard",
+    layout="wide",
+)
+
+st.title("🚚 Carrier Lane Analyzer & Scorecard")
+st.caption(
+    "Upload a CSV with carrier performance. The app recommends the best carrier(s) per lane "
+    "and builds a carrier scorecard. Weights: Milestone Completeness 50%, Shipment Volume 30% "
+    "(min–max scaled within lane), Tracked % 20%. Tie-breaker: lowest Avg Ping Frequency (mins). "
+    "All numbers are rounded to 1 decimal place. Multi-carrier lanes apply a min 5 shipments rule with fallback."
+)
+
+# ---------------------------
+# Canonical columns & aliases (case-insensitive)
+# ---------------------------
+CANON = {
+    "carrier": "Carrier Name",
+    "pickup": "Pickup Location",
+    "dropoff": "Dropoff Location",
+    "volume": "Shipment Volume",
+    "tracked": "Tracked Percentage",
+    "avg_ping": "Avg Ping Frequency Mins",
+    "mc": "Milestone Completeness Percent",
+    "oa": "Origin Arrival Milestones Percent",
+    "od": "Origin Departure Milestones Percent",
+    "da": "Destination Arrival Milestones Percent",
+    "dd": "Destination Departure Milestones Percent",
+    "pu30": "Pickup Arrival Within 30 Min Percent",
+    "do30": "Dropoff Arrival Within 30 Min Percent",
+}
+
+ALIASES = {
+    "carrier": ["carrier name", "carrier", "provider", "carriername"],
+    "pickup": ["pickup location", "pickup", "origin", "origin location", "origin city", "origin_city"],
+    "dropoff": ["dropoff location", "dropoff", "destination", "destination location", "destination city", "dest"],
+    "volume": ["shipment volume", "volume", "shipments", "loads", "shipment count", "num shipments", "no of shipments"],
+    "tracked": ["tracked percentage", "tracked %", "tracking percentage", "tracking %", "tracked", "track %"],
+    "avg_ping": ["avg ping frequency mins", "avg ping", "avg ping (mins)", "avg ping mins", "ping frequency", "ping mins"],
+    "mc": ["milestone completeness percent", "milestone completeness", "milestone %", "mc %"],
+    "oa": ["origin arrival milestones percent", "origin arrival %", "origin arrival pct"],
+    "od": ["origin departure milestones percent", "origin departure %", "origin departure pct"],
+    "da": ["destination arrival milestones percent", "destination arrival %", "destination arrival pct"],
+    "dd": ["destination departure milestones percent", "destination departure %", "destination departure pct"],
+    "pu30": ["pickup arrival within 30 min percent", "pickup arrival within 30 minutes percent", "pickup arrival ≤30 min %"],
+    "do30": ["dropoff arrival within 30 min percent", "dropoff arrival within 30 minutes percent", "dropoff arrival ≤30 min %"],
+}
+
+NUMERIC_KEYS = ["volume", "tracked", "avg_ping", "mc", "oa", "od", "da", "dd", "pu30", "do30"]
+PCT_KEYS = ["tracked", "mc", "oa", "od", "da", "dd", "pu30", "do30"]
+DECIMALS = 1  # global rounding
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def normalize(s: str) -> str:
+    return "".join(ch.lower() for ch in str(s) if ch.isalnum())
+
+def suggest_mapping(cols: List[str]) -> Dict[str, str]:
+    norm_cols = {normalize(c): c for c in cols}
+    mapping = {}
+    for key, alias_list in ALIASES.items():
+        sel = None
+        for alias in alias_list:
+            n = normalize(alias)
+            if n in norm_cols:
+                sel = norm_cols[n]
+                break
+        if sel is None:
+            canon = CANON[key]
+            if normalize(canon) in norm_cols:
+                sel = norm_cols[normalize(canon)]
+        mapping[key] = sel
+    return mapping
+
+def to_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+def ensure_percent_scale(s: pd.Series) -> pd.Series:
+    s = to_numeric(s)
+    if s.dropna().max() is not None and s.dropna().max() <= 1.0:
+        return s * 100.0
+    return s
+
+def minmax_scale_0_100(x: pd.Series) -> pd.Series:
+    x = to_numeric(x).astype(float)
+    if x.empty:
+        return x
+    xmin, xmax = x.min(), x.max()
+    if pd.isna(xmin) or pd.isna(xmax):
+        return x * np.nan
+    if np.isclose(xmin, xmax):
+        return pd.Series(100.0, index=x.index)
+    return 100.0 * (x - xmin) / (xmax - xmin)
+
+def lane_key(row, pickup_col, dropoff_col) -> str:
+    return f"{row[pickup_col]} ⟶ {row[dropoff_col]}"
+
+def round_numeric(df: pd.DataFrame, decimals: int = DECIMALS) -> pd.DataFrame:
+    out = df.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    out[num_cols] = out[num_cols].round(decimals)
+    return out
+
+# ---------------------------
+# Core compute (with min-5 rule)
+# ---------------------------
 def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    MIN_SHIPMENTS = 5  # new rule: apply only when a lane has > 1 carrier
+    MIN_SHIPMENTS = 5  # apply only for lanes with >1 carrier
 
     # Rename to canonical for internal calc
     rename_map = {mapping[k]: CANON[k] for k in mapping if mapping[k]}
@@ -12,7 +131,7 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
     if missing:
         raise ValueError(f"Missing required columns after mapping: {missing}")
 
-    # Numeric conversions (percent fields auto-scale to 0–100)
+    # Numeric conversions (auto-scale percentage fields)
     for k in NUMERIC_KEYS:
         col = CANON[k]
         if col in work.columns:
@@ -41,13 +160,13 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
     work_sorted = work.sort_values(["Lane", "Weighted Score", CANON["avg_ping"]],
                                    ascending=[True, False, True]).copy()
 
-    # ---------- Build Lane Recommendations with min-5 rule ----------
+    # ---------- Lane Recommendations with min-5 rule ----------
     rec_rows = []
     for lane, g in work_sorted.groupby("Lane", sort=False):
         g = g.reset_index(drop=True)
         multi_carrier = (g["Carriers on this lane"].iat[0] or 0) > 1
 
-        # Apply min-5 filter only for multi-carrier lanes; fallback to all rows if none meet it
+        # For multi-carrier lanes, consider only rows with >= 5 shipments; fallback to all if none
         if multi_carrier:
             g_candidates = g[g[CANON["volume"]].fillna(0) >= MIN_SHIPMENTS]
             if g_candidates.empty:
@@ -55,7 +174,6 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
         else:
             g_candidates = g.copy()
 
-        # If still empty (edge-case), skip lane
         if g_candidates.empty:
             continue
 
@@ -66,115 +184,9 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
         r1["Recommendation Rank"] = 1
         rec_rows.append(r1)
 
-        # Recommendation #2 (within 10% of top score, from the candidate set)
+        # Recommendation #2 within 10% of top (still within the candidate set)
         threshold = 0.9 * top_score
         candidates2 = g_candidates.iloc[1:]
         candidates2 = candidates2[candidates2["Weighted Score"] >= threshold]
         if not candidates2.empty:
-            r2 = candidates2.iloc[0].copy()  # already sorted by score desc, ping asc
-            r2["Recommendation Rank"] = 2
-            rec_rows.append(r2)
-
-    lane_recs = pd.DataFrame(rec_rows)
-
-    # ---------- Carrier Scorecard ----------
-    # Counts of lanes by rank
-    rank_counts = (
-        lane_recs.pivot_table(
-            index=CANON["carrier"],
-            columns="Recommendation Rank",
-            values="Lane",
-            aggfunc=lambda s: s.nunique(),
-            fill_value=0,
-        )
-        .rename(columns={1: "Lanes as Recommendation #1", 2: "Lanes as Recommendation #2"})
-        .reset_index()
-    )
-
-    # Aggregates from the full dataset
-    agg_map = {
-        CANON["volume"]: "sum",      # Shipment Volume (sum)
-        CANON["tracked"]: "mean",    # Visibility Percentage (mean)
-        CANON["mc"]: "mean",         # Milestone Completeness (mean)
-        CANON["avg_ping"]: "mean",   # Avg Ping Frequency Mins (mean)
-    }
-    for k in ["oa", "od", "da", "dd", "pu30", "do30"]:
-        col = CANON[k]
-        if col in work.columns:
-            agg_map[col] = "mean"
-
-    base_agg = work.groupby(CANON["carrier"]).agg(agg_map).reset_index()
-
-    # Build final scorecard with exact headers
-    scorecard = base_agg.rename(columns={
-        CANON["carrier"]: "Carrier Name",
-        CANON["volume"]: "Shipment Volume",
-        CANON["tracked"]: "Visibility Percentage",
-        CANON["mc"]: "Milestone Completeness Percent",
-        CANON["avg_ping"]: "Avg Ping Frequency Mins",
-        CANON.get("oa", "Origin Arrival Milestones Percent"): "Origin Arrival Milestones Percent",
-        CANON.get("od", "Origin Departure Milestones Percent"): "Origin Departure Milestones Percent",
-        CANON.get("da", "Destination Arrival Milestones Percent"): "Destination Arrival Milestones Percent",
-        CANON.get("dd", "Destination Departure Milestones Percent"): "Destination Departure Milestones Percent",
-        CANON.get("pu30", "Pickup Arrival Within 30 Min Percent"): "Pickup Arrival Within 30 Min Percent",
-        CANON.get("do30", "Dropoff Arrival Within 30 Min Percent"): "Dropoff Arrival Within 30 Min Percent",
-    })
-    scorecard = scorecard.merge(rank_counts, on="Carrier Name", how="left").fillna(
-        {"Lanes as Recommendation #1": 0, "Lanes as Recommendation #2": 0}
-    )
-
-    # Exact column order for scorecard
-    scorecard_cols = [
-        "Carrier Name",
-        "Lanes as Recommendation #1",
-        "Lanes as Recommendation #2",
-        "Shipment Volume",
-        "Visibility Percentage",
-        "Milestone Completeness Percent",
-        "Avg Ping Frequency Mins",
-        "Origin Arrival Milestones Percent",
-        "Origin Departure Milestones Percent",
-        "Destination Arrival Milestones Percent",
-        "Destination Departure Milestones Percent",
-        "Pickup Arrival Within 30 Min Percent",
-        "Dropoff Arrival Within 30 Min Percent",
-    ]
-    for c in scorecard_cols:
-        if c not in scorecard.columns:
-            scorecard[c] = np.nan
-    scorecard = scorecard[scorecard_cols]
-
-    # ---------- Lane Recommendations output (your exact order) ----------
-    lane_cols = [
-        CANON["pickup"],                         # Pickup Location
-        CANON["dropoff"],                        # Dropoff Location
-        "Lane",
-        CANON["carrier"],                        # Carrier Name
-        "Carriers on this lane",
-        "Recommendation Rank",
-        CANON["volume"],                         # Shipment Volume
-        CANON["tracked"],                        # Tracked Percentage
-        CANON["mc"],                             # Milestone Completeness Percent
-        CANON["avg_ping"],                       # Avg Ping Frequency Mins
-        CANON.get("oa", "Origin Arrival Milestones Percent"),
-        CANON.get("od", "Origin Departure Milestones Percent"),
-        CANON.get("da", "Destination Arrival Milestones Percent"),
-        CANON.get("dd", "Destination Departure Milestones Percent"),
-        CANON.get("pu30", "Pickup Arrival Within 30 Min Percent"),
-        CANON.get("do30", "Dropoff Arrival Within 30 Min Percent"),
-    ]
-    for c in lane_cols:
-        if c not in lane_recs.columns:
-            lane_recs[c] = np.nan
-    lane_recs_final = lane_recs[lane_cols].copy()
-
-    # Round numerics and sort both sheets by Shipment Volume (desc)
-    lane_recs_final = round_numeric(lane_recs_final, DECIMALS)
-    scorecard = round_numeric(scorecard, DECIMALS)
-
-    if CANON["volume"] in lane_recs_final.columns:
-        lane_recs_final = lane_recs_final.sort_values(by=CANON["volume"], ascending=False, kind="mergesort")
-    if "Shipment Volume" in scorecard.columns:
-        scorecard = scorecard.sort_values(by="Shipment Volume", ascending=False, kind="mergesort")
-
-    return lane_recs_final, scorecard
+            r2 = candidates2.iloc[0].copy()

@@ -190,3 +190,237 @@ def compute_recommendations(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[
         candidates2 = candidates2[candidates2["Weighted Score"] >= threshold]
         if not candidates2.empty:
             r2 = candidates2.iloc[0].copy()
+            r2["Recommendation Rank"] = 2
+            rec_rows.append(r2)
+
+    lane_recs = pd.DataFrame(rec_rows)
+
+    # ---------- Carrier Scorecard ----------
+    # Counts of lanes by rank
+    rank_counts = (
+        lane_recs.pivot_table(
+            index=CANON["carrier"],
+            columns="Recommendation Rank",
+            values="Lane",
+            aggfunc=lambda s: s.nunique(),
+            fill_value=0,
+        )
+        .rename(columns={1: "Lanes as Recommendation #1", 2: "Lanes as Recommendation #2"})
+        .reset_index()
+    )
+
+    # Aggregates from full dataset
+    agg_map = {
+        CANON["volume"]: "sum",
+        CANON["tracked"]: "mean",
+        CANON["mc"]: "mean",
+        CANON["avg_ping"]: "mean",
+    }
+    for k in ["oa", "od", "da", "dd", "pu30", "do30"]:
+        col = CANON[k]
+        if col in work.columns:
+            agg_map[col] = "mean"
+
+    base_agg = work.groupby(CANON["carrier"]).agg(agg_map).reset_index()
+
+    # Final scorecard headers (ensure Carrier Name shows)
+    scorecard = base_agg.rename(columns={
+        CANON["carrier"]: "Carrier Name",
+        CANON["volume"]: "Shipment Volume",
+        CANON["tracked"]: "Visibility Percentage",
+        CANON["mc"]: "Milestone Completeness Percent",
+        CANON["avg_ping"]: "Avg Ping Frequency Mins",
+        CANON.get("oa", "Origin Arrival Milestones Percent"): "Origin Arrival Milestones Percent",
+        CANON.get("od", "Origin Departure Milestones Percent"): "Origin Departure Milestones Percent",
+        CANON.get("da", "Destination Arrival Milestones Percent"): "Destination Arrival Milestones Percent",
+        CANON.get("dd", "Destination Departure Milestones Percent"): "Destination Departure Milestones Percent",
+        CANON.get("pu30", "Pickup Arrival Within 30 Min Percent"): "Pickup Arrival Within 30 Min Percent",
+        CANON.get("do30", "Dropoff Arrival Within 30 Min Percent"): "Dropoff Arrival Within 30 Min Percent",
+    })
+    scorecard = scorecard.merge(rank_counts, on="Carrier Name", how="left").fillna(
+        {"Lanes as Recommendation #1": 0, "Lanes as Recommendation #2": 0}
+    )
+
+    # Exact scorecard column order
+    scorecard_cols = [
+        "Carrier Name",
+        "Lanes as Recommendation #1",
+        "Lanes as Recommendation #2",
+        "Shipment Volume",
+        "Visibility Percentage",
+        "Milestone Completeness Percent",
+        "Avg Ping Frequency Mins",
+        "Origin Arrival Milestones Percent",
+        "Origin Departure Milestones Percent",
+        "Destination Arrival Milestones Percent",
+        "Destination Departure Milestones Percent",
+        "Pickup Arrival Within 30 Min Percent",
+        "Dropoff Arrival Within 30 Min Percent",
+    ]
+    for c in scorecard_cols:
+        if c not in scorecard.columns:
+            scorecard[c] = np.nan
+    scorecard = scorecard[scorecard_cols]
+
+    # ---------- Lane Recommendations output (exact order you asked) ----------
+    lane_cols = [
+        CANON["pickup"],                         # Pickup Location
+        CANON["dropoff"],                        # Dropoff Location
+        "Lane",
+        CANON["carrier"],                        # Carrier Name
+        "Carriers on this lane",
+        "Recommendation Rank",
+        CANON["volume"],                         # Shipment Volume
+        CANON["tracked"],                        # Tracked Percentage
+        CANON["mc"],                             # Milestone Completeness Percent
+        CANON["avg_ping"],                       # Avg Ping Frequency Mins
+        CANON.get("oa", "Origin Arrival Milestones Percent"),
+        CANON.get("od", "Origin Departure Milestones Percent"),
+        CANON.get("da", "Destination Arrival Milestones Percent"),
+        CANON.get("dd", "Destination Departure Milestones Percent"),
+        CANON.get("pu30", "Pickup Arrival Within 30 Min Percent"),
+        CANON.get("do30", "Dropoff Arrival Within 30 Min Percent"),
+    ]
+    for c in lane_cols:
+        if c not in lane_recs.columns:
+            lane_recs[c] = np.nan
+    lane_recs_final = lane_recs[lane_cols].copy()
+
+    # Round numerics and sort both sheets by Shipment Volume (desc)
+    lane_recs_final = round_numeric(lane_recs_final, DECIMALS)
+    scorecard = round_numeric(scorecard, DECIMALS)
+
+    if CANON["volume"] in lane_recs_final.columns:
+        lane_recs_final = lane_recs_final.sort_values(by=CANON["volume"], ascending=False, kind="mergesort")
+    if "Shipment Volume" in scorecard.columns:
+        scorecard = scorecard.sort_values(by="Shipment Volume", ascending=False, kind="mergesort")
+
+    return lane_recs_final, scorecard
+
+# ---------------------------
+# Excel writer
+# ---------------------------
+def autosize_and_write_excel(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+            ws = writer.sheets[name]
+            ws.freeze_panes(1, 0)
+            # Simple autofit by measuring string lengths
+            for idx, col in enumerate(df.columns):
+                series = df[col].astype(str)
+                max_len = max([len(col)] + series.map(len).tolist())
+                ws.set_column(idx, idx, min(max_len + 2, 60))
+    return output.getvalue()
+
+# ---------------------------
+# Sidebar: file input + mapping + customer name (filename only)
+# ---------------------------
+with st.sidebar:
+    st.header("Upload & Column Mapping")
+    uploaded = st.file_uploader("Upload CSV file", type=["csv"])
+    customer_name = st.text_input("Customer Name (used in file name only)", placeholder="e.g., Acme Corp")
+
+    if uploaded is not None:
+        try:
+            raw = pd.read_csv(uploaded)
+        except Exception:
+            uploaded.seek(0)
+            raw = pd.read_csv(uploaded, encoding_errors="ignore")
+        st.success(f"Loaded {raw.shape[0]:,} rows × {raw.shape[1]} columns")
+
+        mapping = suggest_mapping(list(raw.columns))
+        st.write("**Detected mapping** (edit if needed):")
+        for key in CANON.keys():
+            options = ["-- Unmapped --"] + list(raw.columns)
+            default = mapping.get(key)
+            idx = options.index(default) if default in options else 0
+            sel = st.selectbox(f"{CANON[key]}", options=options, index=idx, key=f"map_{key}")
+            mapping[key] = None if sel == "-- Unmapped --" else sel
+
+        required_keys = ["carrier", "pickup", "dropoff", "volume", "tracked", "avg_ping", "mc"]
+        missing_keys = [k for k in required_keys if not mapping.get(k)]
+        if missing_keys:
+            st.error("Please map all required fields: " + ", ".join(CANON[k] for k in missing_keys))
+        else:
+            st.success("All required fields mapped. You’re good to go!")
+
+# ---------------------------
+# Main
+# ---------------------------
+if uploaded is None:
+    st.info("⬅️ Upload your CSV to get started.")
+else:
+    mapping_live = {}
+    for key in CANON.keys():
+        sel = st.session_state.get(f"map_{key}")
+        if sel and sel != "-- Unmapped --":
+            mapping_live[key] = sel
+
+    with st.expander("Preview uploaded data"):
+        st.dataframe(raw.head(25), use_container_width=True)
+
+    if st.button("🔍 Run Lane Analysis & Build Scorecard", type="primary"):
+        try:
+            lane_recs, carrier_scorecard = compute_recommendations(raw, mapping_live)
+
+            st.subheader("✅ Lane Recommendations (Truckload Analytics)")
+            st.caption(
+                "Rank 1 present per lane; Rank 2 shown if within 10% of Rank 1’s score. "
+                "Columns for scaled volume and weighted score are omitted. "
+                "Numbers rounded to 1 decimal place. Sorted by Shipment Volume (desc)."
+            )
+            st.dataframe(lane_recs, use_container_width=True, height=420)
+
+            # Filter & download by lanes
+            st.markdown("### 🎯 Download Truckload Analytics filtered by Lanes")
+            st.info(
+                "Instructions:\n"
+                "1) Use the **lane filter** below to select one or more lanes.\n"
+                "2) The table updates to only those lanes.\n"
+                "3) Click **Download filtered lanes (XLSX)**."
+            )
+            lane_options = sorted(lane_recs["Lane"].unique().tolist()) if "Lane" in lane_recs.columns else []
+            selected_lanes = st.multiselect("Filter by Lane", lane_options, placeholder="Select lanes…")
+            lane_filtered = lane_recs[lane_recs["Lane"].isin(selected_lanes)] if selected_lanes else lane_recs
+            st.dataframe(lane_filtered, use_container_width=True, height=300)
+
+            def sanitize_filename(s: str) -> str:
+                s = "".join(c for c in s if c.isalnum() or c in (" ", "-", "_")).strip()
+                return s.replace(" ", "_")
+
+            main_name = "Lane Analysis_Carrier Scorecard"
+            if customer_name:
+                main_name = f"{sanitize_filename(customer_name)}_Lane Analysis_Carrier Scorecard"
+
+            filtered_name = "Truckload_Analytics_Filtered_by_Lanes"
+            if customer_name:
+                filtered_name = f"{sanitize_filename(customer_name)}_{filtered_name}"
+
+            # Downloads
+            filtered_xlsx = autosize_and_write_excel({"Lane Recommendations (Filtered)": lane_filtered})
+            st.download_button(
+                label="⬇️ Download filtered lanes (XLSX)",
+                data=filtered_xlsx,
+                file_name=f"{filtered_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            st.subheader("📊 Carrier Scorecard")
+            st.dataframe(carrier_scorecard, use_container_width=True, height=420)
+
+            xlsx_bytes = autosize_and_write_excel({
+                "Lane Recommendations": lane_recs,
+                "Carrier Scorecard": carrier_scorecard
+            })
+            st.download_button(
+                label="⬇️ Download XLSX (Lane Recommendations + Carrier Scorecard)",
+                data=xlsx_bytes,
+                file_name=f"{main_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            st.success("Done! Downloads are ready.")
+        except Exception as e:
+            st.exception(e)
